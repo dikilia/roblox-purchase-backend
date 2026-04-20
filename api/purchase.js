@@ -1,36 +1,60 @@
 const express = require('express');
 const cors = require('cors');
-const Database = require('better-sqlite3');
+const initSqlJs = require('sql.js');
+const fs = require('fs');
 const path = require('path');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Use /tmp for SQLite in Vercel (ephemeral, but works for queue)
-const dbPath = process.env.NODE_ENV === 'production' 
-  ? '/tmp/purchases.db' 
-  : './purchases.db';
+let db;
+const DB_PATH = '/tmp/purchases.db';
 
-const db = new Database(dbPath);
+// Initialize SQL.js database
+async function initDatabase() {
+  const SQL = await initSqlJs();
+  
+  // Try to load existing database from /tmp
+  let dbData;
+  try {
+    dbData = fs.readFileSync(DB_PATH);
+  } catch {
+    dbData = null;
+  }
+  
+  db = new SQL.Database(dbData);
+  
+  // Create table if not exists
+  db.run(`
+    CREATE TABLE IF NOT EXISTS purchase_queue (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      cookie TEXT NOT NULL,
+      gamepass_id TEXT NOT NULL,
+      status TEXT DEFAULT 'pending',
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      processed_at DATETIME,
+      error_message TEXT,
+      user_id TEXT,
+      transaction_id TEXT
+    )
+  `);
+  
+  // Save initial database
+  saveDatabase();
+}
 
-// Create table
-db.exec(`
-  CREATE TABLE IF NOT EXISTS purchase_queue (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    cookie TEXT NOT NULL,
-    gamepass_id TEXT NOT NULL,
-    status TEXT DEFAULT 'pending',
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    processed_at DATETIME,
-    error_message TEXT,
-    user_id TEXT,
-    transaction_id TEXT
-  )
-`);
+function saveDatabase() {
+  const data = db.export();
+  const buffer = Buffer.from(data);
+  fs.writeFileSync(DB_PATH, buffer);
+}
+
+// Initialize on startup
+initDatabase().catch(console.error);
 
 // Add purchase to queue (PUBLIC endpoint)
-app.post('/api/queue-purchase', (req, res) => {
+app.post('/api/queue-purchase', async (req, res) => {
   const { cookie, gamepassId } = req.body;
   
   if (!cookie || !gamepassId) {
@@ -38,14 +62,19 @@ app.post('/api/queue-purchase', (req, res) => {
   }
 
   try {
-    const stmt = db.prepare(
-      'INSERT INTO purchase_queue (cookie, gamepass_id) VALUES (?, ?)'
+    db.run(
+      'INSERT INTO purchase_queue (cookie, gamepass_id) VALUES (?, ?)',
+      [cookie, gamepassId]
     );
-    const result = stmt.run(cookie, gamepassId);
+    saveDatabase();
+    
+    // Get the last inserted ID
+    const result = db.exec("SELECT last_insert_rowid() as id");
+    const queueId = result[0].values[0][0];
     
     res.json({ 
       success: true, 
-      queueId: result.lastInsertRowid,
+      queueId: queueId,
       message: 'Purchase queued. Your local bridge will process it.'
     });
   } catch (err) {
@@ -54,17 +83,25 @@ app.post('/api/queue-purchase', (req, res) => {
 });
 
 // Get queue status (PUBLIC endpoint)
-app.get('/api/queue-status/:id', (req, res) => {
+app.get('/api/queue-status/:id', async (req, res) => {
   try {
-    const stmt = db.prepare('SELECT * FROM purchase_queue WHERE id = ?');
-    const row = stmt.get(req.params.id);
+    const result = db.exec(`SELECT * FROM purchase_queue WHERE id = ${req.params.id}`);
     
-    if (!row) {
+    if (!result.length || !result[0].values.length) {
       return res.status(404).json({ error: 'Queue item not found' });
     }
     
-    // Don't send the cookie back to frontend
-    delete row.cookie;
+    const columns = result[0].columns;
+    const values = result[0].values[0];
+    
+    const row = {};
+    columns.forEach((col, i) => {
+      // Don't send the cookie back to frontend
+      if (col !== 'cookie') {
+        row[col] = values[i];
+      }
+    });
+    
     res.json(row);
   } catch (err) {
     res.status(500).json({ error: 'Database error' });
@@ -72,7 +109,7 @@ app.get('/api/queue-status/:id', (req, res) => {
 });
 
 // Get pending purchases (PROTECTED - only for bridge)
-app.get('/api/pending-purchases', (req, res) => {
+app.get('/api/pending-purchases', async (req, res) => {
   const authToken = req.headers['x-bridge-token'];
   
   if (authToken !== process.env.BRIDGE_SECRET) {
@@ -80,10 +117,22 @@ app.get('/api/pending-purchases', (req, res) => {
   }
 
   try {
-    const stmt = db.prepare(
+    const result = db.exec(
       "SELECT * FROM purchase_queue WHERE status = 'pending' ORDER BY created_at ASC LIMIT 5"
     );
-    const rows = stmt.all();
+    
+    if (!result.length) {
+      return res.json([]);
+    }
+    
+    const rows = result[0].values.map(values => {
+      const row = {};
+      result[0].columns.forEach((col, i) => {
+        row[col] = values[i];
+      });
+      return row;
+    });
+    
     res.json(rows);
   } catch (err) {
     res.status(500).json({ error: 'Database error' });
@@ -91,7 +140,7 @@ app.get('/api/pending-purchases', (req, res) => {
 });
 
 // Update purchase status (PROTECTED - only for bridge)
-app.post('/api/update-purchase', (req, res) => {
+app.post('/api/update-purchase', async (req, res) => {
   const authToken = req.headers['x-bridge-token'];
   
   if (authToken !== process.env.BRIDGE_SECRET) {
@@ -101,7 +150,7 @@ app.post('/api/update-purchase', (req, res) => {
   const { id, status, errorMessage, userId, transactionId } = req.body;
 
   try {
-    const stmt = db.prepare(`
+    db.run(`
       UPDATE purchase_queue 
       SET status = ?, 
           processed_at = CURRENT_TIMESTAMP,
@@ -109,8 +158,9 @@ app.post('/api/update-purchase', (req, res) => {
           user_id = ?,
           transaction_id = ?
       WHERE id = ?
-    `);
-    stmt.run(status, errorMessage, userId, transactionId, id);
+    `, [status, errorMessage || null, userId || null, transactionId || null, id]);
+    
+    saveDatabase();
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: 'Update failed' });
@@ -127,6 +177,7 @@ app.get('/', (req, res) => {
   res.json({ 
     name: 'Roblox Gamepass Queue API',
     version: '1.0.0',
+    status: 'online',
     endpoints: [
       'POST /api/queue-purchase',
       'GET /api/queue-status/:id',
@@ -137,11 +188,3 @@ app.get('/', (req, res) => {
 
 // For Vercel serverless
 module.exports = app;
-
-// For local development
-if (require.main === module) {
-  const PORT = process.env.PORT || 3001;
-  app.listen(PORT, () => {
-    console.log(`Backend running on http://localhost:${PORT}`);
-  });
-}
