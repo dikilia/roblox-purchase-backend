@@ -6,12 +6,16 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// PostgreSQL connection pool
+// PostgreSQL connection pool with Supabase pooler
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL || 'postgresql://postgres:l56MlTLdqPIJprtt@db.laceyqhdrxivqhzdvqua.supabase.co:5432/postgres',
+  connectionString: process.env.DATABASE_URL,
   ssl: {
     rejectUnauthorized: false
-  }
+  },
+  // Additional settings for serverless
+  max: 1,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 5000,
 });
 
 // Initialize table
@@ -39,6 +43,7 @@ async function initDatabase() {
   }
 }
 
+// Initialize on startup
 initDatabase();
 
 // Health check
@@ -58,7 +63,7 @@ app.get('/', (req, res) => {
   res.json({ 
     name: 'Roblox Gamepass Queue API',
     version: '2.0.0',
-    database: 'Supabase PostgreSQL',
+    database: 'Supabase PostgreSQL (Pooler)',
     status: 'online'
   });
 });
