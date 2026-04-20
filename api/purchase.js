@@ -1,69 +1,69 @@
 const express = require('express');
 const cors = require('cors');
-const initSqlJs = require('sql.js');
-const fs = require('fs');
+const { Pool } = require('pg');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-let db;
-const DB_PATH = '/tmp/purchases.db';
-
-// Initialize SQL.js database
-async function initDatabase() {
-  const SQL = await initSqlJs();
-  
-  let dbData;
-  try {
-    dbData = fs.readFileSync(DB_PATH);
-  } catch {
-    dbData = null;
+// PostgreSQL connection pool
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL || 'postgresql://postgres:l56MlTLdqPIJprtt@db.laceyqhdrxivqhzdvqua.supabase.co:5432/postgres',
+  ssl: {
+    rejectUnauthorized: false
   }
-  
-  db = new SQL.Database(dbData);
-  
-  db.run(`
-    CREATE TABLE IF NOT EXISTS purchase_queue (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      cookie TEXT NOT NULL,
-      gamepass_id TEXT NOT NULL,
-      status TEXT DEFAULT 'pending',
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      processed_at DATETIME,
-      error_message TEXT,
-      user_id TEXT,
-      transaction_id TEXT
-    )
-  `);
-  
-  saveDatabase();
+});
+
+// Initialize table
+async function initDatabase() {
+  const client = await pool.connect();
+  try {
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS purchase_queue (
+        id BIGSERIAL PRIMARY KEY,
+        cookie TEXT NOT NULL,
+        gamepass_id TEXT NOT NULL,
+        status TEXT DEFAULT 'pending',
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        processed_at TIMESTAMPTZ,
+        error_message TEXT,
+        user_id TEXT,
+        transaction_id TEXT
+      )
+    `);
+    console.log('✅ Database initialized');
+  } catch (err) {
+    console.error('❌ Database init failed:', err.message);
+  } finally {
+    client.release();
+  }
 }
 
-function saveDatabase() {
-  const data = db.export();
-  const buffer = Buffer.from(data);
-  fs.writeFileSync(DB_PATH, buffer);
-}
+initDatabase();
 
-// Initialize on startup
-initDatabase().catch(console.error);
-
-// Health check endpoint - ADDED FIRST for quick response
-app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+// Health check
+app.get('/api/health', async (req, res) => {
+  try {
+    const client = await pool.connect();
+    await client.query('SELECT 1');
+    client.release();
+    res.json({ status: 'ok', database: 'connected', timestamp: new Date().toISOString() });
+  } catch (err) {
+    res.status(500).json({ status: 'error', database: 'disconnected', error: err.message });
+  }
 });
 
 // Root endpoint
 app.get('/', (req, res) => {
   res.json({ 
     name: 'Roblox Gamepass Queue API',
-    version: '1.0.0',
+    version: '2.0.0',
+    database: 'Supabase PostgreSQL',
     status: 'online'
   });
 });
 
-// Add purchase to queue
+// Queue purchase
 app.post('/api/queue-purchase', async (req, res) => {
   const { cookie, gamepassId } = req.body;
   
@@ -71,52 +71,49 @@ app.post('/api/queue-purchase', async (req, res) => {
     return res.status(400).json({ error: 'Missing cookie or gamepassId' });
   }
 
+  const client = await pool.connect();
   try {
-    db.run(
-      'INSERT INTO purchase_queue (cookie, gamepass_id) VALUES (?, ?)',
+    const result = await client.query(
+      'INSERT INTO purchase_queue (cookie, gamepass_id) VALUES ($1, $2) RETURNING id',
       [cookie, gamepassId]
     );
-    saveDatabase();
-    
-    const result = db.exec("SELECT last_insert_rowid() as id");
-    const queueId = result[0].values[0][0];
     
     res.json({ 
       success: true, 
-      queueId: queueId,
+      queueId: result.rows[0].id,
       message: 'Purchase queued. Your local bridge will process it.'
     });
   } catch (err) {
+    console.error('Queue error:', err.message);
     res.status(500).json({ error: 'Failed to queue purchase' });
+  } finally {
+    client.release();
   }
 });
 
 // Get queue status
 app.get('/api/queue-status/:id', async (req, res) => {
+  const client = await pool.connect();
   try {
-    const result = db.exec(`SELECT * FROM purchase_queue WHERE id = ${req.params.id}`);
+    const result = await client.query(
+      'SELECT id, gamepass_id, status, created_at, processed_at, error_message, user_id, transaction_id FROM purchase_queue WHERE id = $1',
+      [req.params.id]
+    );
     
-    if (!result.length || !result[0].values.length) {
+    if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Queue item not found' });
     }
     
-    const columns = result[0].columns;
-    const values = result[0].values[0];
-    
-    const row = {};
-    columns.forEach((col, i) => {
-      if (col !== 'cookie') {
-        row[col] = values[i];
-      }
-    });
-    
-    res.json(row);
+    res.json(result.rows[0]);
   } catch (err) {
+    console.error('Status error:', err.message);
     res.status(500).json({ error: 'Database error' });
+  } finally {
+    client.release();
   }
 });
 
-// Get pending purchases
+// Get pending purchases (PROTECTED - for bridge)
 app.get('/api/pending-purchases', async (req, res) => {
   const authToken = req.headers['x-bridge-token'];
   
@@ -124,30 +121,21 @@ app.get('/api/pending-purchases', async (req, res) => {
     return res.status(401).json({ error: 'Unauthorized' });
   }
 
+  const client = await pool.connect();
   try {
-    const result = db.exec(
+    const result = await client.query(
       "SELECT * FROM purchase_queue WHERE status = 'pending' ORDER BY created_at ASC LIMIT 5"
     );
-    
-    if (!result.length) {
-      return res.json([]);
-    }
-    
-    const rows = result[0].values.map(values => {
-      const row = {};
-      result[0].columns.forEach((col, i) => {
-        row[col] = values[i];
-      });
-      return row;
-    });
-    
-    res.json(rows);
+    res.json(result.rows);
   } catch (err) {
+    console.error('Pending error:', err.message);
     res.status(500).json({ error: 'Database error' });
+  } finally {
+    client.release();
   }
 });
 
-// Update purchase status
+// Update purchase status (PROTECTED - for bridge)
 app.post('/api/update-purchase', async (req, res) => {
   const authToken = req.headers['x-bridge-token'];
   
@@ -157,21 +145,25 @@ app.post('/api/update-purchase', async (req, res) => {
 
   const { id, status, errorMessage, userId, transactionId } = req.body;
 
+  const client = await pool.connect();
   try {
-    db.run(`
-      UPDATE purchase_queue 
-      SET status = ?, 
-          processed_at = CURRENT_TIMESTAMP,
-          error_message = ?,
-          user_id = ?,
-          transaction_id = ?
-      WHERE id = ?
-    `, [status, errorMessage || null, userId || null, transactionId || null, id]);
+    await client.query(
+      `UPDATE purchase_queue 
+       SET status = $1, 
+           processed_at = NOW(), 
+           error_message = $2, 
+           user_id = $3, 
+           transaction_id = $4
+       WHERE id = $5`,
+      [status, errorMessage || null, userId || null, transactionId || null, id]
+    );
     
-    saveDatabase();
     res.json({ success: true });
   } catch (err) {
+    console.error('Update error:', err.message);
     res.status(500).json({ error: 'Update failed' });
+  } finally {
+    client.release();
   }
 });
 
