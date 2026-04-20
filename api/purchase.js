@@ -1,175 +1,284 @@
 const express = require('express');
 const cors = require('cors');
-const { Pool } = require('pg');
+const axios = require('axios');
 
 const app = express();
-app.use(cors());
+
+// Enable CORS for your frontend
+app.use(cors({
+  origin: [
+    'https://roblox-purchase-frontend.vercel.app',
+    'http://localhost:3000'
+  ],
+  credentials: true
+}));
+
 app.use(express.json());
 
-// PostgreSQL connection pool with Supabase pooler
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: {
-    rejectUnauthorized: false
-  },
-  // Additional settings for serverless
-  max: 1,
-  idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 5000,
-});
-
-// Initialize table
-async function initDatabase() {
-  const client = await pool.connect();
-  try {
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS purchase_queue (
-        id BIGSERIAL PRIMARY KEY,
-        cookie TEXT NOT NULL,
-        gamepass_id TEXT NOT NULL,
-        status TEXT DEFAULT 'pending',
-        created_at TIMESTAMPTZ DEFAULT NOW(),
-        processed_at TIMESTAMPTZ,
-        error_message TEXT,
-        user_id TEXT,
-        transaction_id TEXT
-      )
-    `);
-    console.log('✅ Database initialized');
-  } catch (err) {
-    console.error('❌ Database init failed:', err.message);
-  } finally {
-    client.release();
-  }
-}
-
-// Initialize on startup
-initDatabase();
-
-// Health check
-app.get('/api/health', async (req, res) => {
-  try {
-    const client = await pool.connect();
-    await client.query('SELECT 1');
-    client.release();
-    res.json({ status: 'ok', database: 'connected', timestamp: new Date().toISOString() });
-  } catch (err) {
-    res.status(500).json({ status: 'error', database: 'disconnected', error: err.message });
-  }
+// Health check endpoint
+app.get('/api/health', (req, res) => {
+  res.json({ 
+    status: 'ok', 
+    service: 'Roblox Purchase Proxy',
+    timestamp: new Date().toISOString()
+  });
 });
 
 // Root endpoint
 app.get('/', (req, res) => {
   res.json({ 
-    name: 'Roblox Gamepass Queue API',
+    name: 'Roblox Purchase Proxy API',
     version: '2.0.0',
-    database: 'Supabase PostgreSQL (Pooler)',
-    status: 'online'
+    endpoints: [
+      'POST /api/proxy-purchase - Execute gamepass purchase',
+      'GET /api/health - Health check'
+    ]
   });
 });
 
-// Queue purchase
-app.post('/api/queue-purchase', async (req, res) => {
+// Main proxy endpoint for purchasing gamepasses
+app.post('/api/proxy-purchase', async (req, res) => {
   const { cookie, gamepassId } = req.body;
-  
-  if (!cookie || !gamepassId) {
-    return res.status(400).json({ error: 'Missing cookie or gamepassId' });
-  }
 
-  const client = await pool.connect();
-  try {
-    const result = await client.query(
-      'INSERT INTO purchase_queue (cookie, gamepass_id) VALUES ($1, $2) RETURNING id',
-      [cookie, gamepassId]
-    );
-    
-    res.json({ 
-      success: true, 
-      queueId: result.rows[0].id,
-      message: 'Purchase queued. Your local bridge will process it.'
+  // Validation
+  if (!cookie) {
+    return res.status(400).json({ 
+      success: false, 
+      error: 'Missing cookie' 
     });
-  } catch (err) {
-    console.error('Queue error:', err.message);
-    res.status(500).json({ error: 'Failed to queue purchase' });
-  } finally {
-    client.release();
   }
-});
 
-// Get queue status
-app.get('/api/queue-status/:id', async (req, res) => {
-  const client = await pool.connect();
+  if (!gamepassId) {
+    return res.status(400).json({ 
+      success: false, 
+      error: 'Missing gamepassId' 
+    });
+  }
+
+  // Validate cookie format
+  if (!cookie.includes('_|WARNING')) {
+    return res.status(400).json({ 
+      success: false, 
+      error: 'Invalid cookie format. Should start with "_|WARNING"' 
+    });
+  }
+
+  // Validate gamepass ID is numeric
+  if (!/^\d+$/.test(gamepassId)) {
+    return res.status(400).json({ 
+      success: false, 
+      error: 'Gamepass ID must be numeric' 
+    });
+  }
+
   try {
-    const result = await client.query(
-      'SELECT id, gamepass_id, status, created_at, processed_at, error_message, user_id, transaction_id FROM purchase_queue WHERE id = $1',
-      [req.params.id]
-    );
+    // Create axios instance with cookie
+    const session = axios.create({
+      headers: {
+        Cookie: `.ROBLOSECURITY=${cookie.trim()}`,
+        'Content-Type': 'application/json',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+      },
+      timeout: 30000 // 30 second timeout
+    });
+
+    // Step 1: Get CSRF Token
+    let csrfToken;
+    try {
+      const csrfResponse = await session.post('https://auth.roblox.com/v2/logout', {});
+      csrfToken = csrfResponse.headers['x-csrf-token'];
+      
+      if (!csrfToken) {
+        throw new Error('No CSRF token in response headers');
+      }
+    } catch (error) {
+      if (error.response?.status === 401 || error.response?.status === 403) {
+        return res.status(401).json({
+          success: false,
+          error: 'Invalid or expired cookie. Please refresh your cookie and try again.'
+        });
+      }
+      throw new Error(`Failed to get CSRF token: ${error.message}`);
+    }
+
+    // Step 2: Get authenticated user info
+    let userId, username;
+    try {
+      const userResponse = await session.get('https://users.roblox.com/v1/users/authenticated');
+      userId = userResponse.data.id;
+      username = userResponse.data.name;
+    } catch (error) {
+      return res.status(401).json({
+        success: false,
+        error: 'Failed to authenticate user. Cookie may be invalid.'
+      });
+    }
+
+    // Step 3: Get gamepass product info
+    let productData;
+    try {
+      const productResponse = await session.get(
+        `https://economy.roblox.com/v1/game-pass/${gamepassId}/product-info`
+      );
+      productData = productResponse.data;
+    } catch (error) {
+      if (error.response?.status === 404) {
+        return res.status(404).json({
+          success: false,
+          error: `Gamepass ID ${gamepassId} not found`
+        });
+      }
+      throw new Error(`Failed to get gamepass info: ${error.message}`);
+    }
+
+    // Check if gamepass is for sale
+    if (!productData.Price) {
+      return res.status(400).json({
+        success: false,
+        error: 'This gamepass is not for sale or is free'
+      });
+    }
+
+    // Step 4: Execute purchase
+    let purchaseResult;
+    try {
+      const purchaseData = {
+        expectedCurrency: 1, // 1 = Robux
+        expectedPrice: productData.Price,
+        expectedSellerId: productData.Creator.Id
+      };
+
+      const purchaseResponse = await session.post(
+        `https://economy.roblox.com/v1/purchases/products/${productData.ProductId}`,
+        purchaseData,
+        { 
+          headers: { 
+            'x-csrf-token': csrfToken,
+            'Content-Type': 'application/json'
+          } 
+        }
+      );
+
+      purchaseResult = purchaseResponse.data;
+    } catch (error) {
+      // Handle specific Roblox error responses
+      if (error.response?.data?.errors) {
+        const robloxError = error.response.data.errors[0];
+        
+        if (robloxError.message?.includes('InsufficientFunds')) {
+          return res.status(402).json({
+            success: false,
+            error: 'Insufficient Robux to purchase this gamepass',
+            required: productData.Price
+          });
+        }
+        
+        if (robloxError.message?.includes('AlreadyOwned')) {
+          return res.status(409).json({
+            success: false,
+            error: 'You already own this gamepass'
+          });
+        }
+        
+        return res.status(400).json({
+          success: false,
+          error: robloxError.message || 'Purchase failed'
+        });
+      }
+      
+      throw error;
+    }
+
+    // Success response
+    return res.json({
+      success: true,
+      message: 'Purchase completed successfully',
+      data: {
+        userId: userId,
+        username: username,
+        gamepassId: gamepassId,
+        gamepassName: productData.Name,
+        price: productData.Price,
+        productId: productData.ProductId,
+        transactionId: purchaseResult.transactionId || 'N/A',
+        purchasedAt: new Date().toISOString()
+      }
+    });
+
+  } catch (error) {
+    console.error('Proxy purchase error:', error.message);
     
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Queue item not found' });
+    // Check if it's a network/timeout error
+    if (error.code === 'ECONNABORTED' || error.message.includes('timeout')) {
+      return res.status(504).json({
+        success: false,
+        error: 'Request timeout. Roblox API may be slow. Please try again.'
+      });
     }
     
-    res.json(result.rows[0]);
-  } catch (err) {
-    console.error('Status error:', err.message);
-    res.status(500).json({ error: 'Database error' });
-  } finally {
-    client.release();
+    // Generic error
+    return res.status(500).json({
+      success: false,
+      error: 'An unexpected error occurred. Please try again later.',
+      details: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
   }
 });
 
-// Get pending purchases (PROTECTED - for bridge)
-app.get('/api/pending-purchases', async (req, res) => {
-  const authToken = req.headers['x-bridge-token'];
-  
-  if (authToken !== process.env.BRIDGE_SECRET) {
-    return res.status(401).json({ error: 'Unauthorized' });
+// Get gamepass info endpoint (optional, for preview)
+app.get('/api/gamepass-info/:id', async (req, res) => {
+  const gamepassId = req.params.id;
+  const cookie = req.headers['x-roblox-cookie'];
+
+  if (!cookie) {
+    return res.status(400).json({ error: 'Cookie required in x-roblox-cookie header' });
   }
 
-  const client = await pool.connect();
   try {
-    const result = await client.query(
-      "SELECT * FROM purchase_queue WHERE status = 'pending' ORDER BY created_at ASC LIMIT 5"
+    const session = axios.create({
+      headers: {
+        Cookie: `.ROBLOSECURITY=${cookie}`,
+        'User-Agent': 'Mozilla/5.0'
+      }
+    });
+
+    const response = await session.get(
+      `https://economy.roblox.com/v1/game-pass/${gamepassId}/product-info`
     );
-    res.json(result.rows);
-  } catch (err) {
-    console.error('Pending error:', err.message);
-    res.status(500).json({ error: 'Database error' });
-  } finally {
-    client.release();
+
+    res.json({
+      success: true,
+      data: {
+        id: gamepassId,
+        name: response.data.Name,
+        price: response.data.Price,
+        creator: response.data.Creator.Name,
+        productId: response.data.ProductId
+      }
+    });
+  } catch (error) {
+    res.status(error.response?.status || 500).json({
+      success: false,
+      error: 'Failed to fetch gamepass info'
+    });
   }
 });
 
-// Update purchase status (PROTECTED - for bridge)
-app.post('/api/update-purchase', async (req, res) => {
-  const authToken = req.headers['x-bridge-token'];
-  
-  if (authToken !== process.env.BRIDGE_SECRET) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-
-  const { id, status, errorMessage, userId, transactionId } = req.body;
-
-  const client = await pool.connect();
-  try {
-    await client.query(
-      `UPDATE purchase_queue 
-       SET status = $1, 
-           processed_at = NOW(), 
-           error_message = $2, 
-           user_id = $3, 
-           transaction_id = $4
-       WHERE id = $5`,
-      [status, errorMessage || null, userId || null, transactionId || null, id]
-    );
-    
-    res.json({ success: true });
-  } catch (err) {
-    console.error('Update error:', err.message);
-    res.status(500).json({ error: 'Update failed' });
-  } finally {
-    client.release();
-  }
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({ error: 'Endpoint not found' });
 });
 
+// For Vercel serverless
 module.exports = app;
+
+// For local development
+if (require.main === module) {
+  const PORT = process.env.PORT || 3001;
+  app.listen(PORT, () => {
+    console.log(`✅ Backend proxy running on http://localhost:${PORT}`);
+    console.log(`📡 Endpoints:`);
+    console.log(`   POST /api/proxy-purchase`);
+    console.log(`   GET  /api/health`);
+  });
+}
