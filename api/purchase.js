@@ -2,7 +2,6 @@ const express = require('express');
 const cors = require('cors');
 const initSqlJs = require('sql.js');
 const fs = require('fs');
-const path = require('path');
 
 const app = express();
 app.use(cors());
@@ -15,7 +14,6 @@ const DB_PATH = '/tmp/purchases.db';
 async function initDatabase() {
   const SQL = await initSqlJs();
   
-  // Try to load existing database from /tmp
   let dbData;
   try {
     dbData = fs.readFileSync(DB_PATH);
@@ -25,7 +23,6 @@ async function initDatabase() {
   
   db = new SQL.Database(dbData);
   
-  // Create table if not exists
   db.run(`
     CREATE TABLE IF NOT EXISTS purchase_queue (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -40,7 +37,6 @@ async function initDatabase() {
     )
   `);
   
-  // Save initial database
   saveDatabase();
 }
 
@@ -53,7 +49,21 @@ function saveDatabase() {
 // Initialize on startup
 initDatabase().catch(console.error);
 
-// Add purchase to queue (PUBLIC endpoint)
+// Health check endpoint - ADDED FIRST for quick response
+app.get('/api/health', (req, res) => {
+  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
+// Root endpoint
+app.get('/', (req, res) => {
+  res.json({ 
+    name: 'Roblox Gamepass Queue API',
+    version: '1.0.0',
+    status: 'online'
+  });
+});
+
+// Add purchase to queue
 app.post('/api/queue-purchase', async (req, res) => {
   const { cookie, gamepassId } = req.body;
   
@@ -68,7 +78,6 @@ app.post('/api/queue-purchase', async (req, res) => {
     );
     saveDatabase();
     
-    // Get the last inserted ID
     const result = db.exec("SELECT last_insert_rowid() as id");
     const queueId = result[0].values[0][0];
     
@@ -82,7 +91,7 @@ app.post('/api/queue-purchase', async (req, res) => {
   }
 });
 
-// Get queue status (PUBLIC endpoint)
+// Get queue status
 app.get('/api/queue-status/:id', async (req, res) => {
   try {
     const result = db.exec(`SELECT * FROM purchase_queue WHERE id = ${req.params.id}`);
@@ -96,7 +105,6 @@ app.get('/api/queue-status/:id', async (req, res) => {
     
     const row = {};
     columns.forEach((col, i) => {
-      // Don't send the cookie back to frontend
       if (col !== 'cookie') {
         row[col] = values[i];
       }
@@ -108,7 +116,7 @@ app.get('/api/queue-status/:id', async (req, res) => {
   }
 });
 
-// Get pending purchases (PROTECTED - only for bridge)
+// Get pending purchases
 app.get('/api/pending-purchases', async (req, res) => {
   const authToken = req.headers['x-bridge-token'];
   
@@ -139,7 +147,7 @@ app.get('/api/pending-purchases', async (req, res) => {
   }
 });
 
-// Update purchase status (PROTECTED - only for bridge)
+// Update purchase status
 app.post('/api/update-purchase', async (req, res) => {
   const authToken = req.headers['x-bridge-token'];
   
@@ -167,24 +175,4 @@ app.post('/api/update-purchase', async (req, res) => {
   }
 });
 
-// Health check endpoint
-app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
-});
-
-// Root endpoint
-app.get('/', (req, res) => {
-  res.json({ 
-    name: 'Roblox Gamepass Queue API',
-    version: '1.0.0',
-    status: 'online',
-    endpoints: [
-      'POST /api/queue-purchase',
-      'GET /api/queue-status/:id',
-      'GET /api/health'
-    ]
-  });
-});
-
-// For Vercel serverless
 module.exports = app;
